@@ -3,6 +3,16 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+#screenshots
+*.png
+*.jpeg
+*.jpg
+*.webp
+*.avif
+
+# dummy user data
+user_data
+railway_session
 # C extensions
 *.so
 
