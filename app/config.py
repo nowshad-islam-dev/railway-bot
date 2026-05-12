@@ -8,3 +8,4 @@ class Config:
     PASSWORD = os.getenv("RAILWAY_PASS")
     BASE_URL = "https://eticket.railway.gov.bd"
     LOGIN_URL = f"{BASE_URL}/login"
+    TICKET_URL=f"{BASE_URL}/booking/train/search"
