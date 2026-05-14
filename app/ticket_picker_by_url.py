@@ -3,6 +3,9 @@ from app.config import Config
 from loguru import logger
 
 
+MAX_SEATS = 4  # Hard limit per account
+
+
 async def fetch_trains(
     page,
     from_city: str,
@@ -12,6 +15,9 @@ async def fetch_trains(
     seat_count: int = 4,
     preferred_train: str = None,
 ):
+    # Clamp to the hard max of 4
+    seat_count = min(seat_count, MAX_SEATS)
+
     ticket_url = (
         f"{Config.TICKET_URL}"
         f"?fromcity={from_city}"
@@ -29,11 +35,16 @@ async def fetch_trains(
     )
     await asyncio.sleep(1)  # Let Angular finish re-rendering all rows
 
-    await click_book_now(page, ticket_class, seat_count, preferred_train)
-    await asyncio.sleep(3)
-    await select_seats(page)
-    await asyncio.sleep(20)
-    # await continue_purchase(page)
+    # await click_book_now(page, ticket_class, seat_count, preferred_train)
+    return
+
+    # selected_count = await select_seats_with_coach_fallback(page, seat_count)
+
+    # if selected_count > 0:
+    #     logger.success(f"Total seats locked: {selected_count}")
+    #     # await continue_purchase(page)
+    # else:
+    #     logger.error("Failed to select any seats.")
 
 
 async def click_book_now(
@@ -137,15 +148,13 @@ async def click_book_now(
     logger.info(f"Clicked BOOK NOW — {best_train} / {ticket_class}")
 
 
-async def select_best_coach(page) -> int:
+async def get_ranked_coaches(page) -> list[tuple[int, str, str]]:
+    """Return coaches sorted by available seats descending: [(seats, value, label)]."""
     coach_select = page.locator("#select-bogie")
     await coach_select.wait_for(state="visible", timeout=15_000)
 
     options = await coach_select.locator("option").all()
-
-    best_value = None
-    best_seats = 0
-    best_label = None
+    coaches = []
 
     for option in options:
         text = (await option.inner_text()).strip()
@@ -158,15 +167,24 @@ async def select_best_coach(page) -> int:
 
         logger.info(f"  Coach: {text}")
 
-        if seat_count > best_seats:
-            best_seats = seat_count
-            best_value = value
-            best_label = text
+        if seat_count > 0:
+            coaches.append((seat_count, value, text))
 
-    if best_value is None or best_seats == 0:
-        raise Exception("No coaches with available seats found.")
+    coaches.sort(key=lambda x: x[0], reverse=True)
+    return coaches
 
-    logger.info(f"Selecting coach: {best_label} (value={best_value})")
+
+async def apply_coach_selection(page, coach_value: str, coach_label: str) -> bool:
+    """Select a specific coach and wait for the seat map to re-render."""
+    # Skip if already selected
+    current_value = await page.evaluate(
+        "() => document.querySelector('#select-bogie')?.value"
+    )
+    if current_value == coach_value:
+        logger.info(f"Coach {coach_label} already selected, skipping switch.")
+        return True
+
+    logger.info(f"Switching to coach: {coach_label} (value={coach_value})")
 
     # Bootstrap Select + Angular — must set value via native setter
     # and fire both 'change' and 'input' events to trigger Angular's change detection
@@ -176,81 +194,261 @@ async def select_best_coach(page) -> int:
             const select = document.querySelector('#select-bogie');
             if (!select) throw new Error('Coach select not found');
 
-            // Use native setter to bypass Angular's value tracking
             const nativeSetter = Object.getOwnPropertyDescriptor(
                 window.HTMLSelectElement.prototype, 'value'
             ).set;
             nativeSetter.call(select, value);
 
-            // Fire events Angular listens to
             select.dispatchEvent(new Event('change', { bubbles: true }));
             select.dispatchEvent(new Event('input', { bubbles: true }));
         }
         """,
-        best_value,
+        coach_value,
     )
 
     # Wait for Angular to re-render the seat map
-    await page.wait_for_load_state(timeout=15_000)
-    await asyncio.sleep(1)
+    await asyncio.sleep(1.5)
 
-    # Verify the selection actually changed by re-reading the select value
-    current_value = await page.evaluate(
-        "() => document.querySelector('#select-bogie').value"
+    # Verify the selection actually changed
+    new_value = await page.evaluate(
+        "() => document.querySelector('#select-bogie')?.value"
     )
-    if current_value != best_value:
+    if new_value != coach_value:
         logger.warning(
-            f"Coach selection may not have registered. "
-            f"Expected {best_value}, got {current_value}"
+            f"Coach selection failed. Expected {coach_value}, got {new_value}"
         )
+        return False
 
-    return best_seats
+    return True
 
 
-async def select_seats(page, count: int = 4):
-    logger.info("Waiting for seat map to load...")
+SEAT_AVAILABLE = "button.btn-seat.seat-available"
+SEAT_SELECTED = "button.btn-seat.seat-selected"
 
-    # Handle coach selection first
-    coach_selector = page.locator("#select-bogie")
-    if await coach_selector.count() > 0:
-        available_in_coach = await select_best_coach(page)
-        logger.info(f"Coach selected — {available_in_coach} seats available")
 
-    available_seat = page.locator(
-        "button.seat-available, button.btn-seat.seat-available"
-    )
-    await available_seat.first.wait_for(state="visible", timeout=30_000)
-
-    total_available = await available_seat.count()
-    logger.info(f"Found {total_available} selectable seats in coach.")
-
-    if total_available == 0:
-        raise Exception("No available seats found in selected coach.")
-
-    to_select = min(count, total_available)
-
-    if to_select < count:
-        logger.warning(
-            f"Requested {count} seats but only {total_available} available. "
-            f"Proceeding with {to_select}."
+async def dismiss_swal2(page):
+    """Dismiss any SweetAlert2 modal that may be blocking clicks."""
+    swal = page.locator(".swal2-container")
+    if await swal.count() > 0:
+        logger.info("SweetAlert2 modal detected — dismissing...")
+        # Try confirm button first, then cancel, then click backdrop
+        for selector in [
+            ".swal2-confirm",
+            ".swal2-cancel",
+            ".swal2-close",
+            ".swal2-container",
+        ]:
+            btn = page.locator(selector)
+            if await btn.count() > 0:
+                try:
+                    await btn.first.click(timeout=2_000)
+                    await asyncio.sleep(0.5)
+                    if await swal.count() == 0:
+                        logger.info("SweetAlert2 dismissed.")
+                        return
+                except Exception:
+                    continue
+        # Last resort: remove it via JS
+        await page.evaluate(
+            "document.querySelector('.swal2-container')?.remove()"
         )
+        logger.info("SweetAlert2 removed via JS.")
+        await asyncio.sleep(0.3)
 
-    selected = []
-    seats = await available_seat.all()
-    for seat in seats[:to_select]:
-        seat_title = await seat.get_attribute("title")
-        await seat.click()
-        selected.append(seat_title)
-        logger.info(f"Selected seat: {seat_title}")
+
+async def get_total_selected(page) -> int:
+    """Count all currently selected seats across all coaches (DOM truth)."""
+    return await page.locator(SEAT_SELECTED).count()
+
+
+async def select_seats_in_current_coach(
+    page, need: int, already_selected: int
+) -> int:
+    """
+    Select up to `need` MORE seats in the currently-displayed coach.
+    Returns how many NEW seats were successfully selected.
+
+    - Checks the DOM for `seat-available` buttons and clicks them one by one.
+    - After each click, verifies the total selected count went up.
+    - If a click triggers a swal2 error (seat snatched), dismisses it and moves on.
+    - Never deselects an already-selected seat.
+    """
+    await dismiss_swal2(page)
+
+    logger.info(f"Need {need} more seat(s). Already selected: {already_selected}")
+
+    new_selections = 0
+    consecutive_failures = 0
+    max_consecutive_failures = 8  # give up on this coach after too many fails
+
+    while new_selections < need and consecutive_failures < max_consecutive_failures:
+        # Dismiss modals if they reappear mid-selection
+        swal = page.locator(".swal2-container")
+        if await swal.count() > 0:
+            await dismiss_swal2(page)
+            await asyncio.sleep(0.3)
+
+        # Fresh DOM query each iteration
+        available = page.locator(SEAT_AVAILABLE)
+        available_count = await available.count()
+
+        if available_count == 0:
+            logger.warning("No more available seats in this coach.")
+            break
+
+        # Snapshot selected count BEFORE clicking
+        selected_before = await get_total_selected(page)
+
+        target = available.first
+        seat_title = await target.get_attribute("title") or "unknown"
+
+        # Click the seat
+        try:
+            await target.dispatch_event("click")
+        except Exception as e:
+            logger.warning(f"Click failed on {seat_title}: {e}")
+            consecutive_failures += 1
+            await asyncio.sleep(0.3)
+            continue
+
+        # Brief pause for Angular to update DOM
         await asyncio.sleep(0.4)
 
-    logger.success(f"Selected {len(selected)} seats: {', '.join(selected)}")
-    return selected
+        # Dismiss any error modal that may have appeared (seat snatched by someone)
+        swal = page.locator(".swal2-container")
+        if await swal.count() > 0:
+            logger.warning(f"Seat {seat_title} might be snatched — swal appeared.")
+            await dismiss_swal2(page)
+            consecutive_failures += 1
+            await asyncio.sleep(0.3)
+            continue
+
+        # Verify: did the total selected count increase?
+        selected_after = await get_total_selected(page)
+
+        if selected_after > selected_before:
+            new_selections += 1
+            consecutive_failures = 0
+            total = already_selected + new_selections
+            logger.info(
+                f"✓ Seat selected: {seat_title}  "
+                f"({total}/{already_selected + need} total)"
+            )
+        else:
+            # The seat may also change to a non-available state without becoming
+            # "selected" (e.g., sold-out). Check if it's gone from available.
+            still_available = await page.locator(
+                f"button.btn-seat.seat-available[title='{seat_title}']"
+            ).count()
+            if still_available > 0:
+                logger.warning(
+                    f"Seat {seat_title} still available after click — "
+                    f"click didn't register."
+                )
+            else:
+                logger.warning(
+                    f"Seat {seat_title} disappeared but wasn't marked selected."
+                )
+            consecutive_failures += 1
+            await asyncio.sleep(0.3)
+
+    if new_selections > 0:
+        logger.success(
+            f"Selected {new_selections} new seat(s) from this coach. "
+            f"Total now: {already_selected + new_selections}"
+        )
+    else:
+        logger.warning("No new seats selected from this coach.")
+
+    return new_selections
 
 
-async def continue_purchase(page):
-    continue_btn = page.locator("button.continue-btn")
-    await continue_btn.wait_for(state="visible", timeout=10_000)
-    await continue_btn.wait_for(state="visible", timeout=10_000)
-    await continue_btn.click()
-    logger.info("Clicked CONTINUE PURCHASE")
+# async def select_seats_with_coach_fallback(
+#     page, count: int = 4
+# ) -> int:
+#     """
+#     Orchestrator: tries coaches in order of most available seats.
+#     Accumulates selections across multiple coaches.
+
+#     Returns the total number of selected seats (1 to count).
+#     Selections persist when switching coaches, so we just keep adding.
+#     """
+#     # Clamp count to max
+#     count = min(count, MAX_SEATS)
+
+#     logger.info("Waiting for seat map to load...")
+
+#     coach_selector = page.locator("#select-bogie")
+#     has_coaches = await coach_selector.count() > 0
+
+#     if not has_coaches:
+#         # No coach dropdown — select seats directly
+#         available = page.locator(SEAT_AVAILABLE)
+#         await available.first.wait_for(state="visible", timeout=30_000)
+#         selected = await select_seats_in_current_coach(page, need=count, already_selected=0)
+#         return selected
+
+#     # Get all coaches ranked by availability
+#     coaches = await get_ranked_coaches(page)
+
+#     if not coaches:
+#         raise Exception("No coaches with available seats found.")
+
+#     total_selected = 0
+
+#     for seats_avail, coach_value, coach_label in coaches:
+#         if total_selected >= count:
+#             break
+
+#         need = count - total_selected
+
+#         logger.info(
+#             f"Trying coach: {coach_label} ({seats_avail} seats available, "
+#             f"need {need} more)"
+#         )
+
+#         ok = await apply_coach_selection(page, coach_value, coach_label)
+#         if not ok:
+#             continue
+
+#         # Wait for seats to appear
+#         available = page.locator(SEAT_AVAILABLE)
+#         try:
+#             await available.first.wait_for(state="visible", timeout=10_000)
+#         except Exception:
+#             logger.warning(f"No seats rendered for {coach_label}, skipping.")
+#             continue
+
+#         # Check how many are already selected (persisted from previous coaches)
+#         already = await get_total_selected(page)
+#         if already > total_selected:
+#             # Selections persisted from previous coach switch — update our count
+#             logger.info(
+#                 f"Detected {already} already-selected seats after coach switch "
+#                 f"(was tracking {total_selected})"
+#             )
+#             total_selected = already
+
+#         if total_selected >= count:
+#             logger.info("Already have enough seats, no more needed.")
+#             break
+
+#         need = count - total_selected
+#         new = await select_seats_in_current_coach(
+#             page, need=need, already_selected=total_selected
+#         )
+#         total_selected += new
+
+#     if total_selected > 0:
+#         logger.success(f"Final seat count: {total_selected}/{count}")
+#     else:
+#         logger.error("Could not select any seats from any coach.")
+
+#     return total_selected
+
+
+# async def continue_purchase(page):
+#     continue_btn = page.locator("button.continue-btn")
+#     await continue_btn.wait_for(state="visible", timeout=10_000)
+#     await continue_btn.click()
+#     logger.info("Clicked CONTINUE PURCHASE")

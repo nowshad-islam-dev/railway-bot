@@ -51,23 +51,23 @@ async def login(page, phone: str, password: str, member_name: str):
     password_input = page.locator("#password")
 
     await page.mouse.move(200, 300)
-    await asyncio.sleep(0.4)
+    await asyncio.sleep(0.1)
     await page.mouse.move(250, 350)
 
     await phone_input.click()
     await phone_input.clear()
-    await phone_input.press_sequentially(phone, delay=120)
+    await phone_input.press_sequentially(phone, delay=100)
     await page.keyboard.press("Tab")
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.1)
 
     await password_input.click()
     await password_input.clear()
-    await password_input.press_sequentially(password, delay=120)
+    await password_input.press_sequentially(password, delay=100)
     await page.keyboard.press("Tab")
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.1)
 
     await wait_for_turnstile(page, timeout=30_000)
-    await asyncio.sleep(1)
+    await asyncio.sleep(0.5)
 
     submit_btn = page.locator("button[type='submit']")
     await submit_btn.wait_for(state="visible", timeout=10_000)
@@ -107,7 +107,7 @@ async def run_member(member: dict):
 
         try:
             await login(page, member["phone"], member["password"], member["name"])
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.1)
             await fetch_trains(
                 page,
                 from_city=Config.FROM_CITY,
@@ -115,13 +115,14 @@ async def run_member(member: dict):
                 date_of_journey=Config.DATE_OF_JOURNEY,
                 ticket_class=Config.TICKET_CLASS,
                 seat_count=Config.SEATS_PER_MEMBER,
+                preferred_train=Config.PREFERRED_TRAIN,
             )
 
         except Exception as e:
             logger.error(f"[{member['name']}] Flow failed: {e}")
-            await page.screenshot(
-                path=f"logs/error_{member['name'].replace(' ', '_')}.png"
-            )
+            # await page.screenshot(
+            #     path=f"logs/error_{member['name'].replace(' ', '_')}.png"
+            # )
 
         finally:
             agree_task.cancel()
